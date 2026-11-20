@@ -10,3 +10,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Local TTS samples (check_tts_coverage.py)
+tts_samples/
+
+# macOS
+.DS_Store

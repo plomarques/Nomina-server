@@ -9,3 +9,6 @@ venv/
 README.md
 Dockerfile
 .dockerignore
+check_tts_coverage.py
+tts_samples/
+.DS_Store
