@@ -5,12 +5,14 @@ import os
 import re
 import time
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from google import genai
-from google.cloud import translate_v2 as translate
+from google.cloud import texttospeech
 from google.genai import types
 from PIL import Image, ImageOps
 from pydantic import BaseModel
+
+import language_support as ls
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("nomina")
@@ -34,7 +36,10 @@ GEMINI_TIMEOUT_MS = 30_000
 # Max size (in pixels) of the longest side of the picture sent to Gemini
 MAX_IMAGE_SIDE = 384
 
-# Accepts codes like "en", "pt", "zh-CN", "haw"
+# Max length of the text sent to /pronounce. Protects the TTS quota: one word or a short expression
+MAX_PRONOUNCE_CHARS = 100
+
+# Accepts codes like "en", "pt", "zh-CN", "haw", "en-GB", "es-419", "mni-Mtei"
 LANGUAGE_CODE_PATTERN = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
 
 # Flask server
@@ -46,8 +51,8 @@ client = genai.Client(
     http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
 )
 
-# Google Cloud Translation API client (uses the Cloud Run service account)
-translate_client = translate.Client()
+# The Cloud Translation and Cloud Text-to-Speech clients live in language_support.py
+# (created on first use, authenticated with the Cloud Run service account).
 
 
 # Class to get structured JSON response from Gemini
@@ -85,11 +90,17 @@ def get_data_2():
     if source_language_code is None or target_language_code is None:
         return jsonify({"error": "Missing or invalid language code."}), 400
 
-    # Building prompt string for Gemini
+    # Building prompt string for Gemini. Code AND English name reduce ambiguity,
+    # and a region in the tag (en-GB, pt-PT...) asks for that region's vocabulary.
+    source_label = ls.english_label(source_language_code)   # e.g. "English (United Kingdom)"
+    target_label = ls.english_label(target_language_code)   # e.g. "Portuguese (Brazil)"
     prompt = (
-        "Identify the main object in the attached picture, translate its name to the source and target languages "
-        f"defined by the ISO-639 codes {source_language_code} and {target_language_code} "
-        "and return the JSON defined by the schema.\n"
+        "Identify the main object in the attached picture and give its common name in two languages, "
+        "identified by BCP-47 language tags:\n"
+        f"- source: {source_language_code} ({source_label})\n"
+        f"- target: {target_language_code} ({target_label})\n"
+        "When a tag includes a region (for example en-GB or pt-PT), use the vocabulary and spelling "
+        "of that region. Return the JSON defined by the schema.\n"
         'If no particular object is detected, translate "No object detected" to both languages.\n'
         'If the process somehow fails, translate "Analysis failed" to both languages.'
     )
@@ -129,14 +140,47 @@ def get_translation_languages(app_language_code):
     try:
         log.info("Downloading languages list for '%s'...", app_language_code)
         t1 = time.time()
-        languages_list = get_translation_languages_list(app_language_code)
-        log.info("Download finished in %.2f s", time.time() - t1)
+        languages_list = ls.build_language_list(app_language_code)
+        log.info("Download finished in %.2f s (%d languages)", time.time() - t1, len(languages_list))
 
         return jsonify(languages_list), 200
 
     except Exception as e:
         log.exception("Error getting languages list: %s", e)
         return jsonify({"error": "Erro interno ao processar a solicitação."}), 500
+
+
+# PRONUNCIATION (Cloud Text-to-Speech)
+# Form fields: text (1 to MAX_PRONOUNCE_CHARS characters) and language_code (the app's code).
+# 200 audio/mpeg with the MP3 bytes (header X-Nomina-Voice = voice used),
+# 400 invalid text or code, 422 language without a TTS voice, 500 Google or internal error.
+@app.route("/pronounce", methods=["POST"])
+def pronounce():
+    text = (request.form.get("text") or "").strip()
+    language_code = clean_language_code(request.form.get("language_code"))
+
+    if not text or len(text) > MAX_PRONOUNCE_CHARS:
+        return jsonify({"error": f"'text' must have 1 to {MAX_PRONOUNCE_CHARS} characters."}), 400
+    if language_code is None:
+        return jsonify({"error": "Missing or invalid language code."}), 400
+
+    try:
+        locale, voice = ls.voice_for(language_code)
+        if voice is None:
+            return jsonify({"error": "Pronunciation not available for this language."}), 422
+
+        response = ls.tts_client().synthesize_speech(
+            input=texttospeech.SynthesisInput(text=text),
+            voice=texttospeech.VoiceSelectionParams(language_code=locale, name=voice),
+            audio_config=texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3),
+        )
+    except Exception as e:
+        log.exception("Error generating pronunciation: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+
+    log.info("Pronunciation: '%s' [%s -> %s, %s]", text, language_code, locale, voice)
+    return Response(response.audio_content, mimetype="audio/mpeg",
+                    headers={"X-Nomina-Voice": voice})
 
 
 # --------------------------------- #
@@ -168,24 +212,13 @@ def prepare_image(image_file) -> types.Part:
 
 
 # - Text translation
-def translate_text(text: str, language_code: str):
-    language_code = language_code.replace('"', "")
-
-    if language_code == "en":
-        return text
-    else:
-        result = translate_client.translate(text, target_language=language_code)
-        return result["translatedText"]
-
-
-# - Download translation languages list
-def get_translation_languages_list(target_language_code: str) -> list:
-    results = translate_client.get_languages(target_language=target_language_code)
-
-    # Inserting appLanguage into the dicts inside results
-    for item in results:
-        item["appLanguage"] = target_language_code
-        item["languageCode"] = item.pop("language")
-        item["translatedName"] = item.pop("name")
-
-    return results
+# Not used by any route (Gemini translates in /get_data_2). Commented out for now;
+# delete it once we are sure it is not needed.
+# def translate_text(text: str, language_code: str):
+#     language_code = language_code.replace('"', "")
+#
+#     if language_code == "en":
+#         return text
+#     else:
+#         result = ls.translate_client().translate(text, target_language=language_code)
+#         return result["translatedText"]
